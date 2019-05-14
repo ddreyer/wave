@@ -3,12 +3,14 @@ package iapi
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"time"
 
 	"github.com/immesys/asn1"
 	"github.com/immesys/wave/serdes"
 	"github.com/immesys/wave/wve"
+	lqibe "github.com/samkumar/embedded-pairing/lang/go/lqibe"
 )
 
 type PEncryptMessage struct {
@@ -27,6 +29,7 @@ type REncryptMessage struct {
 }
 
 func EncryptMessage(ctx context.Context, p *PEncryptMessage) (*REncryptMessage, wve.WVE) {
+	fmt.Println("\nEncrypting Message")
 	if len(p.Content) == 0 {
 		return nil, wve.Err(wve.InvalidParameter, "message to be encrypted is empty")
 	}
@@ -124,6 +127,32 @@ func EncryptMessage(ctx context.Context, p *PEncryptMessage) (*REncryptMessage, 
 	}, nil
 }
 
+func EncryptProof(ctx context.Context, p *PEncryptMessage) ([]byte, wve.WVE) {
+	fmt.Println("Encrypting Proof")
+	if len(p.Content) == 0 {
+		return nil, wve.Err(wve.InvalidParameter, "message to be encrypted is empty")
+	}
+
+	if p.Namespace != nil {
+		outerkey, err := p.Namespace.WR1_DomainVisiblityParams()
+		if err != nil {
+			return nil, wve.Err(wve.InvalidParameter, "namespace missing WR1 parameters")
+		}
+		envelopeKeyCiphertextKey, err := outerkey.GenerateChildKey(ctx, []byte(p.Namespace.Keccak256HI().MultihashString()))
+		if err != nil {
+			panic(err)
+		}
+		ciphertext, err := envelopeKeyCiphertextKey.EncryptMessage(ctx, p.Content)
+		fmt.Println("this is the marshalled ciphertext in EncryptProof")
+		fmt.Println(string(ciphertext[2:98]))
+		if err != nil {
+			panic(err)
+		}
+		return ciphertext, nil
+	}
+	return nil, nil
+}
+
 type WR1MessageDecryptionContext interface {
 	WR1OAQUEKeysForContent(ctx context.Context, dst HashSchemeInstance, delegable bool, slots [][]byte, onResult func(k SlottedSecretKey) bool) error
 	WR1IBEKeysForPartitionLabel(ctx context.Context, dst HashSchemeInstance, onResult func(k EntitySecretKeySchemeInstance) bool) error
@@ -133,6 +162,14 @@ type WR1MessageDecryptionContext interface {
 type PDecryptMessage struct {
 	Decryptor  *EntitySecrets
 	Ciphertext []byte
+	Dctx       WR1MessageDecryptionContext
+}
+type PDecryptProof struct {
+	Decryptor  *EntitySecrets
+	Ciphertext []byte
+	Namespace  *Entity
+	Key        []byte
+	Id         []byte
 	Dctx       WR1MessageDecryptionContext
 }
 type RDecryptMessage struct {
@@ -268,6 +305,137 @@ func DecryptMessage(ctx context.Context, p *PDecryptMessage) (*RDecryptMessage, 
 				Content: contents,
 			}, nil
 		}
+	}
+	return nil, wve.Err(wve.MessageDecryptFailed, "could not decrypt message")
+}
+
+func GetDecryptKey(ctx context.Context, p *PDecryptMessage) ([]byte, []byte, wve.WVE) {
+	fmt.Println("\nGetting Decrypt Key")
+	wo := serdes.WaveWireObject{}
+	rest, err := asn1.Unmarshal(p.Ciphertext, &wo.Content)
+	if len(rest) != 0 || err != nil {
+		return nil, nil, wve.Err(wve.InvalidParameter, "message is malformed")
+	}
+	msg, ok := wo.Content.Content.(serdes.WaveEncryptedMessage)
+	if !ok {
+		return nil, nil, wve.Err(wve.InvalidParameter, "ciphertext is not a wave encrypted message")
+	}
+	for _, k := range msg.Keys {
+		wr1key, ok := k.Content.(serdes.MessageKeyWR1)
+		if ok {
+			if p.Dctx == nil {
+				//We can't try decoding WR1 style messages
+				continue
+			}
+			ns := HashSchemeInstanceFor(&wr1key.Namespace)
+			var key []byte
+			var id []byte
+			if ns.MultihashString() == p.Decryptor.Entity.Keccak256HI().MultihashString() {
+				//Instead of consulting the dctx, lets do it ourselves
+				fmt.Println("doing it ourselves")
+				skr, err := p.Decryptor.WR1LabelKey(ctx, []byte(ns.MultihashString()))
+				if err != nil {
+					panic(err)
+				}
+				sk := skr.(*EntitySecretKey_IBE_BLS12381)
+				key = sk.PrivateKey.Marshal(wkdIBECompressed)
+				id = sk.LQID.Marshal(wkdIBECompressed)
+				fmt.Println("this is the marshalled key/id in GetDecryptKey")
+				fmt.Println(string(key), string(id))
+				fmt.Println(len(key), len(id))
+				fmt.Println("this is the unmarshalled id in GetDecryptKey")
+				fmt.Println(sk.LQID)
+			}
+
+			if key == nil || id == nil {
+				//First get IBE key for namespace
+				p.Dctx.WR1IBEKeysForPartitionLabel(ctx, ns, func(k EntitySecretKeySchemeInstance) bool {
+					fmt.Println("in callback")
+					return false
+				})
+			}
+			if key == nil || id == nil {
+				return nil, nil, wve.Err(wve.MessageDecryptFailed, "could not decrypt message")
+			}
+			return key, id, nil
+		}
+	}
+	return nil, nil, wve.Err(wve.MessageDecryptFailed, "could not decrypt message")
+}
+
+func DecryptProof(ctx context.Context, p *PDecryptProof) ([]byte, wve.WVE) {
+	var plaintext []byte
+	ns := HashSchemeInstanceFor(p.Namespace.Keccak256HI().CanonicalForm())
+	p.Dctx.WR1IBEKeysForPartitionLabel(ctx, ns, func(k EntitySecretKeySchemeInstance) bool {
+		sk := k.(*EntitySecretKey_IBE_BLS12381)
+		lqid := sk.LQID
+		ciphertext := p.Ciphertext
+		if len(ciphertext) < 2 {
+			return true
+		}
+		lqibeCiphertextLength := int(binary.BigEndian.Uint16(ciphertext[0:2]))
+		if len(ciphertext) < lqibeCiphertextLength+2 {
+			return true
+		}
+		lqibeCiphertextBA := ciphertext[2 : lqibeCiphertextLength+2]
+
+		c := lqibe.Ciphertext{}
+		ok := c.Unmarshal(lqibeCiphertextBA, wkdIBECompressed, wkdIBEChecked)
+		if !ok {
+			return true
+		}
+		sharedsecret := make([]byte, 16+12)
+		lqibe.Decrypt(&c, sk.PrivateKey, lqid, sharedsecret)
+		result, ok := aesGCMDecrypt(sharedsecret[:16], ciphertext[lqibeCiphertextLength+2:], sharedsecret[16:])
+		if !ok {
+			return true
+		}
+		plaintext = result
+		return false
+	})
+	if plaintext != nil {
+		return plaintext, nil
+	}
+	return nil, wve.Err(wve.MessageDecryptFailed, "could not decrypt message")
+}
+
+func DecryptProofWithKey(ctx context.Context, p *PDecryptProof) ([]byte, wve.WVE) {
+	var plaintext []byte
+	key := lqibe.SecretKey{}
+	id := lqibe.ID{}
+	if ok := key.Unmarshal(p.Key, wkdIBECompressed, wkdIBEChecked); !ok {
+		return nil, wve.Err(wve.MessageDecryptFailed, "failed to unmarshal key")
+	}
+	if ok := id.Unmarshal(p.Id, wkdIBECompressed, wkdIBEChecked); !ok {
+		return nil, wve.Err(wve.MessageDecryptFailed, "failed to unmarshal id")
+	}
+
+	ciphertext := p.Ciphertext
+	if len(ciphertext) < 2 {
+		return nil, wve.Err(wve.MessageDecryptFailed, "invalid ciphertext length")
+	}
+	lqibeCiphertextLength := int(binary.BigEndian.Uint16(ciphertext[0:2]))
+	if len(ciphertext) < lqibeCiphertextLength+2 {
+		return nil, wve.Err(wve.MessageDecryptFailed, "invalid ciphertext length 2")
+	}
+	lqibeCiphertextBA := ciphertext[2 : lqibeCiphertextLength+2]
+
+	c := lqibe.Ciphertext{}
+	ok := c.Unmarshal(lqibeCiphertextBA, wkdIBECompressed, wkdIBEChecked)
+	if !ok {
+		return nil, wve.Err(wve.MessageDecryptFailed, "failed to unmarshal ciphertext")
+	}
+	sharedsecret := make([]byte, 16+12)
+	lqibe.Decrypt(&c, &key, &id, sharedsecret)
+	// fmt.Println("this is the symmetric key decrypted:")
+	// fmt.Println(string(sharedsecret))
+	result, ok := aesGCMDecrypt(sharedsecret[:16], ciphertext[lqibeCiphertextLength+2:], sharedsecret[16:])
+	if !ok {
+		return nil, wve.Err(wve.MessageDecryptFailed, "failed to aes decrypt")
+	}
+	plaintext = result
+	if plaintext != nil {
+		return plaintext, nil
 	}
 	return nil, wve.Err(wve.MessageDecryptFailed, "could not decrypt message")
 }

@@ -1054,6 +1054,80 @@ func (e *EAPI) EncryptMessage(ctx context.Context, p *pb.EncryptMessageParams) (
 	}, nil
 }
 
+func (e *EAPI) EncryptProof(ctx context.Context, p *pb.EncryptMessageParams) (*pb.EncryptMessageResponse, error) {
+	eng := e.getEngineNoPerspective()
+	params := iapi.PEncryptMessage{}
+	if len(p.SubjectHash) != 0 {
+		subHash := iapi.HashSchemeInstanceFromMultihash(p.SubjectHash)
+		subLoc, err := LocationSchemeInstance(p.SubjectLocation)
+		if err != nil {
+			return &pb.EncryptMessageResponse{
+				Error: ToError(wve.ErrW(wve.InvalidParameter, "could not load subject location", err)),
+			}, nil
+		}
+		if subLoc == nil {
+			subLoc = iapi.SI().DefaultLocation(ctx)
+		}
+		sub, val, uerr := eng.LookupEntity(ctx, subHash, subLoc)
+		if uerr != nil {
+			return &pb.EncryptMessageResponse{
+				Error: ToError(wve.ErrW(wve.LookupFailure, "could not resolve subject", uerr)),
+			}, nil
+		}
+		if !val.Valid {
+			return &pb.EncryptMessageResponse{
+				Error: ToError(wve.Err(wve.LookupFailure, "subject entity is no longer valid")),
+			}, nil
+		}
+		params.Subject = sub
+	}
+	if len(p.Namespace) != 0 {
+		validFrom := TimeFromInt64MillisWithDefault(p.ValidFrom, time.Now())
+		validUntil := TimeFromInt64MillisWithDefault(p.ValidUntil, time.Now())
+		params.ValidAfter = validFrom
+		params.ValidBefore = validUntil
+		nsHash := iapi.HashSchemeInstanceFromMultihash(p.Namespace)
+		if !nsHash.Supported() {
+			return &pb.EncryptMessageResponse{
+				Error: ToError(wve.Err(wve.InvalidParameter, "could not parse namespace")),
+			}, nil
+		}
+		nsLoc, err := LocationSchemeInstance(p.NamespaceLocation)
+		if err != nil {
+			return &pb.EncryptMessageResponse{
+				Error: ToError(wve.ErrW(wve.InvalidParameter, "could not parse namespace location", err)),
+			}, nil
+		}
+		if nsLoc == nil {
+			nsLoc = iapi.SI().DefaultLocation(ctx)
+		}
+		ns, val, uerr := eng.LookupEntity(ctx, nsHash, nsLoc)
+		if uerr != nil {
+			return &pb.EncryptMessageResponse{
+				Error: ToError(wve.ErrW(wve.LookupFailure, "could not resolve namespace", uerr)),
+			}, nil
+		}
+		if !val.Valid {
+			return &pb.EncryptMessageResponse{
+				Error: ToError(wve.Err(wve.LookupFailure, "namespace entity is no longer valid")),
+			}, nil
+		}
+		params.Namespace = ns
+		params.NamespaceLocation = nsLoc
+		params.Resource = p.Resource
+	}
+	params.Content = p.Content
+	rv, err := iapi.EncryptProof(ctx, &params)
+	if err != nil {
+		return &pb.EncryptMessageResponse{
+			Error: ToError(err),
+		}, nil
+	}
+	return &pb.EncryptMessageResponse{
+		Ciphertext: rv,
+	}, nil
+}
+
 func (e *EAPI) DecryptMessage(ctx context.Context, p *pb.DecryptMessageParams) (*pb.DecryptMessageResponse, error) {
 	eng, err := e.getEngine(ctx, p.Perspective)
 	if err != nil {
@@ -1467,4 +1541,120 @@ func (e *EAPI) CompactProof(ctx context.Context, p *pb.CompactProofParams) (*pb.
 	return &pb.CompactProofResponse{
 		ProofDER: rv.DER,
 	}, nil
+}
+
+func (e *EAPI) GetDecryptKey(ctx context.Context, p *pb.DecryptMessageParams) (*pb.GetKeyResponse, error) {
+	eng, err := e.getEngine(ctx, p.Perspective)
+	if err != nil {
+		return &pb.GetKeyResponse{
+			Error: ToError(wve.ErrW(wve.InvalidParameter, "could not create perspective", err)),
+		}, nil
+	}
+
+	if p.ResyncFirst {
+		uerr := eng.ResyncEntireGraph(ctx)
+		if uerr != nil {
+			return &pb.GetKeyResponse{
+				Error: ToError(wve.ErrW(wve.UnknownError, "could not sync graph", uerr)),
+			}, nil
+		}
+		waitchan := eng.WaitForEmptySyncQueue()
+		<-waitchan
+	}
+
+	secret, err := ConvertEntitySecret(ctx, p.Perspective.EntitySecret)
+	if err != nil {
+		return &pb.GetKeyResponse{
+			Error: ToError(err),
+		}, nil
+	}
+	dctx := engine.NewEngineDecryptionContext(eng)
+	dctx.AutoLoadPartitionSecrets(true)
+	params := iapi.PDecryptMessage{
+		Decryptor:  secret,
+		Ciphertext: p.Ciphertext,
+		Dctx:       dctx,
+	}
+	key, id, err := iapi.GetDecryptKey(ctx, &params)
+	if err != nil {
+		return &pb.GetKeyResponse{
+			Error: ToError(err),
+		}, nil
+	}
+	return &pb.GetKeyResponse{
+		Key: key,
+		Id:  id,
+	}, nil
+}
+
+func (e *EAPI) DecryptProof(ctx context.Context, p *pb.DecryptProofParams) (*pb.DecryptMessageResponse, error) {
+	eng, err := e.getEngine(ctx, p.Perspective)
+	if err != nil {
+		return &pb.DecryptMessageResponse{
+			Error: ToError(wve.ErrW(wve.InvalidParameter, "could not create perspective", err)),
+		}, nil
+	}
+
+	if p.ResyncFirst {
+		uerr := eng.ResyncEntireGraph(ctx)
+		if uerr != nil {
+			return &pb.DecryptMessageResponse{
+				Error: ToError(wve.ErrW(wve.UnknownError, "could not sync graph", uerr)),
+			}, nil
+		}
+		waitchan := eng.WaitForEmptySyncQueue()
+		<-waitchan
+	}
+
+	secret, err := ConvertEntitySecret(ctx, p.Perspective.EntitySecret)
+	if err != nil {
+		return &pb.DecryptMessageResponse{
+			Error: ToError(err),
+		}, nil
+	}
+	dctx := engine.NewEngineDecryptionContext(eng)
+	dctx.AutoLoadPartitionSecrets(true)
+	params := iapi.PDecryptProof{
+		Decryptor:  secret,
+		Ciphertext: p.Ciphertext,
+		Dctx:       dctx,
+	}
+	nsHash := iapi.HashSchemeInstanceFromMultihash(p.Namespace)
+	if !nsHash.Supported() {
+		return &pb.DecryptMessageResponse{
+			Error: ToError(wve.Err(wve.InvalidParameter, "could not parse namespace")),
+		}, nil
+	}
+	nsLoc, err := LocationSchemeInstance(p.NamespaceLocation)
+	if err != nil {
+		return &pb.DecryptMessageResponse{
+			Error: ToError(wve.ErrW(wve.InvalidParameter, "could not parse namespace location", err)),
+		}, nil
+	}
+	if nsLoc == nil {
+		nsLoc = iapi.SI().DefaultLocation(ctx)
+	}
+	ns, val, uerr := eng.LookupEntity(ctx, nsHash, nsLoc)
+	if uerr != nil {
+		return &pb.DecryptMessageResponse{
+			Error: ToError(wve.ErrW(wve.LookupFailure, "could not resolve namespace", uerr)),
+		}, nil
+	}
+	if !val.Valid {
+		return &pb.DecryptMessageResponse{
+			Error: ToError(wve.Err(wve.LookupFailure, "namespace entity is no longer valid")),
+		}, nil
+	}
+	params.Namespace = ns
+
+	rv, err := iapi.DecryptProof(ctx, &params)
+	if err != nil {
+		return &pb.DecryptMessageResponse{
+			Error: ToError(err),
+		}, nil
+	}
+	return &pb.DecryptMessageResponse{
+		Content: rv,
+	}, nil
+
 }

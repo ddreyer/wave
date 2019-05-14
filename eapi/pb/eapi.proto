@@ -95,7 +95,25 @@ service WAVE {
       body: "*"
     };
   }
+  rpc EncryptProof(EncryptMessageParams) returns (EncryptMessageResponse) {
+    option (google.api.http) = {
+      post: "/v1/EncryptMessage"
+      body: "*"
+    };
+  }
   rpc DecryptMessage(DecryptMessageParams) returns (DecryptMessageResponse) {
+    option (google.api.http) = {
+      post: "/v1/DecryptMessage"
+      body: "*"
+    };
+  }
+  rpc DecryptProof(DecryptProofParams) returns (DecryptMessageResponse) {
+    option (google.api.http) = {
+      post: "/v1/DecryptMessage"
+      body: "*"
+    };
+  }
+  rpc GetDecryptKey(DecryptMessageParams) returns (GetKeyResponse) {
     option (google.api.http) = {
       post: "/v1/DecryptMessage"
       body: "*"
@@ -343,6 +361,20 @@ message DecryptMessageParams {
   Perspective perspective = 1;
   bytes ciphertext = 2;
   bool resyncFirst = 3;
+}
+message DecryptProofParams {
+  Perspective perspective = 1;
+  bytes ciphertext = 2;
+  bool resyncFirst = 3;
+  bytes namespace = 4;
+  Location namespaceLocation = 5;
+  bytes key = 6;
+  bytes id = 7;
+}
+message GetKeyResponse {
+  Error error = 1;
+  bytes key = 2;
+  bytes id = 3;
 }
 message DecryptMessageResponse {
   Error error = 1;

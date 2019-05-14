@@ -4,3 +4,4 @@ storage/vldmstore/vldmstorage
 storage/vldmstorage/vldmstorage
 waved/cmd/waved
 vendor 
+.vscode
